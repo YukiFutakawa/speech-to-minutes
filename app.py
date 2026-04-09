@@ -1,29 +1,26 @@
 """
 音声議事録ツール — Render中継サーバー
 
-kintone JSから音声/動画データ(Base64)を受け取り、
-ffmpegで音声抽出＆圧縮 → Whisper APIで文字起こし → Claude APIで議事録整形 → 結果を返す
+kintone JSからGoogle DriveのURLを受け取り、
+ファイルをダウンロード → ffmpeg圧縮 → Whisper文字起こし → Claude議事録整形 → 結果を返す
 """
 
 import os
-import base64
+import re
 import tempfile
 import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import imageio_ffmpeg
+import gdown
 
 app = Flask(__name__)
 CORS(app)
 
-# 大きいファイル対応：最大500MB（Base64込み）
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
-
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 
-# ffmpegバイナリパス
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 MINUTES_PROMPT = """以下の文字起こしテキストから議事録を作成してください。
@@ -50,93 +47,128 @@ def health():
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe():
+    """Google DriveのURLを受け取り、議事録を生成"""
+    download_path = None
+    compressed_path = None
+
     try:
         data = request.get_json()
-        if not data or 'audio' not in data:
-            return jsonify({'success': False, 'error': '音声データが送信されていません'}), 400
+        if not data or 'driveUrl' not in data:
+            return jsonify({'success': False, 'error': 'Google DriveのURLが指定されていません'}), 400
 
-        audio_base64 = data['audio']
-        file_name = data.get('fileName', 'audio.m4a')
-        mime_type = data.get('mimeType', 'audio/m4a')
+        drive_url = data['driveUrl'].strip()
 
-        # Base64デコード
-        audio_bytes = base64.b64decode(audio_base64)
-        original_mb = len(audio_bytes) / (1024 * 1024)
-        app.logger.info(f'受信ファイル: {file_name} ({original_mb:.1f}MB)')
-
-        # Step 0: ffmpegで音声抽出＆圧縮（動画→音声、音声→低ビットレート化）
-        compressed_path = compress_audio(audio_bytes, file_name)
-
-        try:
-            compressed_size = os.path.getsize(compressed_path) / (1024 * 1024)
-            app.logger.info(f'圧縮後: {compressed_size:.1f}MB')
-
-            # 圧縮後も25MB超ならエラー
-            if compressed_size > 25:
-                return jsonify({
-                    'success': False,
-                    'error': f'圧縮後もファイルサイズが25MBを超えます（{compressed_size:.1f}MB）。録音時間が長すぎる可能性があります。'
-                }), 400
-
-            # Step 1: Whisper APIで文字起こし
-            transcript = transcribe_with_whisper(compressed_path)
-
-            # Step 2: Claude APIで議事録整形
-            minutes = generate_minutes_with_claude(transcript)
-
+        # Drive ファイルIDを抽出
+        file_id = extract_drive_file_id(drive_url)
+        if not file_id:
             return jsonify({
-                'success': True,
-                'transcript': transcript,
-                'minutes': minutes
-            })
-        finally:
-            if os.path.exists(compressed_path):
-                os.unlink(compressed_path)
+                'success': False,
+                'error': 'Google DriveのURLが認識できません。共有リンクをそのまま貼り付けてください。'
+            }), 400
+
+        app.logger.info(f'Drive file ID: {file_id}')
+
+        # Step 1: Driveからダウンロード
+        download_path = tempfile.mktemp(suffix='.bin')
+        try:
+            gdown.download(id=file_id, output=download_path, quiet=True, fuzzy=True)
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Google Driveからのダウンロードに失敗しました。共有設定を「リンクを知っている全員」に変更してください。'
+            }), 400
+
+        if not os.path.exists(download_path) or os.path.getsize(download_path) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'ファイルが取得できませんでした。共有設定を確認してください。'
+            }), 400
+
+        original_mb = os.path.getsize(download_path) / (1024 * 1024)
+        app.logger.info(f'ダウンロード完了: {original_mb:.1f}MB')
+
+        # Step 2: ffmpegで音声抽出＆圧縮
+        compressed_path = compress_audio(download_path)
+        compressed_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+        app.logger.info(f'圧縮後: {compressed_mb:.1f}MB')
+
+        if compressed_mb > 25:
+            return jsonify({
+                'success': False,
+                'error': f'圧縮後もファイルサイズが25MBを超えます（{compressed_mb:.1f}MB）。録音時間が長すぎる可能性があります。'
+            }), 400
+
+        # Step 3: Whisper APIで文字起こし
+        transcript = transcribe_with_whisper(compressed_path)
+
+        # Step 4: Claude APIで議事録整形
+        minutes = generate_minutes_with_claude(transcript)
+
+        return jsonify({
+            'success': True,
+            'transcript': transcript,
+            'minutes': minutes
+        })
 
     except Exception as e:
         app.logger.exception('処理エラー')
         return jsonify({'success': False, 'error': f'エラーが発生しました: {str(e)}'}), 500
 
+    finally:
+        for p in [download_path, compressed_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
-def compress_audio(audio_bytes, file_name):
+
+def extract_drive_file_id(url):
+    """Google Drive URLからファイルIDを抽出
+
+    対応形式:
+    - https://drive.google.com/file/d/FILE_ID/view
+    - https://drive.google.com/open?id=FILE_ID
+    - https://drive.google.com/uc?id=FILE_ID
+    - FILE_ID（IDのみ）
+    """
+    patterns = [
+        r'/file/d/([a-zA-Z0-9_-]+)',
+        r'[?&]id=([a-zA-Z0-9_-]+)',
+        r'^([a-zA-Z0-9_-]{25,})$',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def compress_audio(input_path):
     """ffmpegで音声を抽出＆圧縮（動画ファイルにも対応）
 
-    - 動画ファイル：音声トラックを抽出
-    - 全ファイル：モノラル、16kHzサンプリング、24kbpsのmp3に変換
-    - 1時間の会議録音でも約10MB程度になる
+    モノラル、16kHzサンプリング、24kbpsのmp3に変換
     """
-    ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else 'bin'
-
-    # 入力ファイルを一時保存
-    with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as tmp_in:
-        tmp_in.write(audio_bytes)
-        input_path = tmp_in.name
-
-    # 出力ファイルパス
     output_path = tempfile.mktemp(suffix='.mp3')
 
-    try:
-        cmd = [
-            FFMPEG_PATH,
-            '-i', input_path,
-            '-vn',                  # 映像トラックを無視
-            '-ac', '1',             # モノラル
-            '-ar', '16000',         # 16kHz（音声認識に十分）
-            '-b:a', '24k',          # 24kbps（低ビットレート）
-            '-f', 'mp3',
-            '-y',                   # 上書き許可
-            output_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=600)
+    cmd = [
+        FFMPEG_PATH,
+        '-i', input_path,
+        '-vn',                  # 映像トラックを無視
+        '-ac', '1',             # モノラル
+        '-ar', '16000',         # 16kHz
+        '-b:a', '24k',          # 24kbps
+        '-f', 'mp3',
+        '-y',
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=600)
 
-        if result.returncode != 0:
-            error_msg = result.stderr.decode('utf-8', errors='ignore')[:500]
-            raise Exception(f'音声変換に失敗しました: {error_msg}')
+    if result.returncode != 0:
+        error_msg = result.stderr.decode('utf-8', errors='ignore')[:500]
+        raise Exception(f'音声変換に失敗しました: {error_msg}')
 
-        return output_path
-    finally:
-        if os.path.exists(input_path):
-            os.unlink(input_path)
+    return output_path
 
 
 def transcribe_with_whisper(audio_path):
